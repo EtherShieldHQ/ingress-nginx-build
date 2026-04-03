@@ -1,0 +1,82 @@
+name: Build and push
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to build'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout upstream fork
+        uses: actions/checkout@v4
+        with:
+          repository: chainguard-forks/ingress-nginx
+          ref: ${{ inputs.tag }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync TAG file with git tag version
+        run: |
+          # Extract version from git tag (controller-v1.15.2 -> v1.15.2)
+          VERSION=$(echo "${{ inputs.tag }}" | sed 's/controller-//')
+          CURRENT=$(cat TAG | tr -d '\n')
+          if [ "$CURRENT" != "$VERSION" ]; then
+            echo "TAG file ($CURRENT) differs from git tag ($VERSION), updating"
+            echo "$VERSION" > TAG
+          fi
+
+      - name: Build and push via Makefile
+        env:
+          REGISTRY: ghcr.io/ethershieldhq/ingress-nginx
+        run: |
+          make release
+
+      - name: Annotate image
+        env:
+          REGISTRY: ghcr.io/ethershieldhq/ingress-nginx
+        run: |
+          TAG=$(cat TAG)
+          # Install crane for manifest annotation
+          go install github.com/google/go-containerregistry/cmd/crane@latest
+          crane mutate ${REGISTRY}/controller:${TAG} \
+            --annotation org.opencontainers.image.description="NGINX Ingress Controller for Kubernetes (Chainguard security fork)" \
+            --annotation org.opencontainers.image.source="https://github.com/chainguard-forks/ingress-nginx" \
+            --annotation org.opencontainers.image.url="https://github.com/EtherShieldHQ/ingress-nginx-build" \
+            --annotation org.opencontainers.image.vendor="EtherShieldHQ" || echo "Annotation failed (non-critical)"
+
+      - name: Checkout this repo to update tag
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Update UPSTREAM_TAG
+        working-directory: self
+        run: |
+          echo "${{ inputs.tag }}" > UPSTREAM_TAG
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add UPSTREAM_TAG
+          git diff --cached --quiet || (git commit -m "build: bump upstream to ${{ inputs.tag }}" && git push)

@@ -1,0 +1,49 @@
+name: Check upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get latest controller tag
+        id: upstream
+        run: |
+          LATEST=$(curl -s https://api.github.com/repos/chainguard-forks/ingress-nginx/tags?per_page=50 \
+            | jq -r '[.[] | select(.name | startswith("controller-"))][0].name')
+          echo "tag=$LATEST" >> $GITHUB_OUTPUT
+          echo "Latest controller tag: $LATEST"
+
+      - name: Compare with current
+        id: compare
+        run: |
+          CURRENT=$(cat UPSTREAM_TAG | tr -d '\n')
+          LATEST="${{ steps.upstream.outputs.tag }}"
+          echo "Current: $CURRENT"
+          echo "Latest:  $LATEST"
+          if [ "$CURRENT" != "$LATEST" ]; then
+            echo "has_update=true" >> $GITHUB_OUTPUT
+            echo "new_tag=$LATEST" >> $GITHUB_OUTPUT
+            echo "New version available!"
+          else
+            echo "has_update=false" >> $GITHUB_OUTPUT
+            echo "Already up to date."
+          fi
+
+      - name: Trigger build
+        if: steps.compare.outputs.has_update == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'build-push.yml',
+              ref: 'main',
+              inputs: { tag: '${{ steps.compare.outputs.new_tag }}' }
+            })
