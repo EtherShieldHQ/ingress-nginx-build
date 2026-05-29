@@ -4,8 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Upstream tag to build'
+        description: "Upstream tag to build"
         required: true
+      force_base_rebuild:
+        description: "Rebuild the nginx base image even if it already exists in GHCR"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io/ethershieldhq/ingress-nginx
+  # Images are amd64-only. Building arm/arm64/s390x would compile the nginx base
+  # under QEMU emulation (hours, risk of job timeout). The controller image arch
+  # must match the base arch, so it is amd64-only too.
+  BUILD_ARCHS: amd64
+  BUILDX_PLATFORMS: linux/amd64
 
 jobs:
   build:
@@ -28,9 +41,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Set up QEMU (multi-arch)
-        uses: docker/setup-qemu-action@v3
-
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -38,34 +48,79 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # ----------------------------------------------------------------------
+      # Build the nginx BASE image from the Chainguard fork source.
+      #
+      # Why: the fork pins NGINX_BASE to upstream registry.k8s.io/.../nginx,
+      # which is frozen (ingress-nginx reached EOL 2026-04-03) and does NOT
+      # carry the fork's nginx CVE backports (e.g. CVE-2026-9256 rewrite heap
+      # overflow). Those patches live in images/nginx/rootfs/patches/ and are
+      # only compiled in when the base image is built from source. A plain
+      # `make release` would link the controller against the unpatched upstream
+      # base. We build the patched base ourselves, publish it to GHCR, and point
+      # the controller build at it (BASE_IMAGE override below).
+      #
+      # The base tag comes from images/nginx/TAG (bumped by the fork whenever a
+      # new nginx patch lands), so it only rebuilds when there is a new base.
+      # ----------------------------------------------------------------------
+      - name: Resolve nginx base tag
+        id: base
+        run: |
+          BASE_TAG=$(cat images/nginx/TAG | tr -d '\n')
+          echo "tag=${BASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "ref=${REGISTRY}/nginx:${BASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "nginx base: ${REGISTRY}/nginx:${BASE_TAG}"
+
+      - name: Build nginx base image (if missing)
+        env:
+          FORCE_REBUILD: ${{ inputs.force_base_rebuild }}
+          BASE_REF: ${{ steps.base.outputs.ref }}
+        run: |
+          if [ "$FORCE_REBUILD" != "true" ] && docker buildx imagetools inspect "$BASE_REF" >/dev/null 2>&1; then
+            echo "nginx base $BASE_REF already in GHCR - skipping rebuild"
+          else
+            echo "Building patched nginx base $BASE_REF ($BUILDX_PLATFORMS)"
+            make -C images/nginx push \
+              REGISTRY="${REGISTRY}" \
+              PLATFORMS="${BUILDX_PLATFORMS}"
+          fi
+
       - name: Sync TAG file with git tag version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           # Extract version from git tag (controller-v1.15.2 -> v1.15.2)
-          VERSION=$(echo "${{ inputs.tag }}" | sed 's/controller-//')
+          VERSION=$(echo "$INPUT_TAG" | sed 's/controller-//')
           CURRENT=$(cat TAG | tr -d '\n')
           if [ "$CURRENT" != "$VERSION" ]; then
             echo "TAG file ($CURRENT) differs from git tag ($VERSION), updating"
             echo "$VERSION" > TAG
           fi
 
-      - name: Build and push via Makefile
+      # Build the controller FROM the patched base (BASE_IMAGE override) instead
+      # of the frozen upstream base pinned in the NGINX_BASE file.
+      - name: Build and push controller
         env:
-          REGISTRY: ghcr.io/ethershieldhq/ingress-nginx
+          BASE_REF: ${{ steps.base.outputs.ref }}
         run: |
-          make release
+          make release \
+            BASE_IMAGE="$BASE_REF" \
+            PLATFORMS="${BUILD_ARCHS}" \
+            BUILDX_PLATFORMS="${BUILDX_PLATFORMS}"
 
       - name: Annotate image
         env:
-          REGISTRY: ghcr.io/ethershieldhq/ingress-nginx
+          BASE_REF: ${{ steps.base.outputs.ref }}
         run: |
           TAG=$(cat TAG)
           # Install crane for manifest annotation
           go install github.com/google/go-containerregistry/cmd/crane@latest
           crane mutate ${REGISTRY}/controller:${TAG} \
-            --annotation org.opencontainers.image.description="NGINX Ingress Controller for Kubernetes (Chainguard security fork)" \
+            --annotation org.opencontainers.image.description="NGINX Ingress Controller for Kubernetes (Chainguard security fork, patched nginx base)" \
             --annotation org.opencontainers.image.source="https://github.com/chainguard-forks/ingress-nginx" \
             --annotation org.opencontainers.image.url="https://github.com/EtherShieldHQ/ingress-nginx-build" \
-            --annotation org.opencontainers.image.vendor="EtherShieldHQ" || echo "Annotation failed (non-critical)"
+            --annotation org.opencontainers.image.vendor="EtherShieldHQ" \
+            --annotation com.ethershieldhq.nginx-base="$BASE_REF" || echo "Annotation failed (non-critical)"
 
       - name: Checkout this repo to update tag
         uses: actions/checkout@v4
@@ -74,9 +129,11 @@ jobs:
 
       - name: Update UPSTREAM_TAG
         working-directory: self
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          echo "${{ inputs.tag }}" > UPSTREAM_TAG
+          echo "$INPUT_TAG" > UPSTREAM_TAG
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add UPSTREAM_TAG
-          git diff --cached --quiet || (git commit -m "build: bump upstream to ${{ inputs.tag }}" && git push)
+          git diff --cached --quiet || (git commit -m "build: bump upstream to $INPUT_TAG" && git push)

@@ -10,20 +10,24 @@ The official Kubernetes ingress-nginx controller reached EOL on April 3, 2026. C
 chainguard-forks/ingress-nginx (source)
         | daily cron detects new controller-* tag
 EtherShieldHQ/ingress-nginx-build (this repo, GitHub Actions)
-        | make release (identical to upstream build process)
-ghcr.io/ethershieldhq/ingress-nginx/controller (public image)
+        | 1. build patched nginx BASE image (make -C images/nginx push)
+        | 2. build controller FROM that base (make release BASE_IMAGE=...)
+ghcr.io/ethershieldhq/ingress-nginx/{nginx,controller,controller-chroot} (public images)
 ```
 
 ## Images
 
 ```
+ghcr.io/ethershieldhq/ingress-nginx/nginx:<base-tag>           # patched nginx base
 ghcr.io/ethershieldhq/ingress-nginx/controller:<tag>
 ghcr.io/ethershieldhq/ingress-nginx/controller-chroot:<tag>
 ```
 
-Multi-arch: `linux/amd64`, `linux/arm64`, `linux/arm/v7`, `linux/s390x`
+`linux/amd64` only. Building arm/arm64/s390x would compile the nginx base under
+QEMU emulation (hours, risk of job timeout); the controller image arch must match
+the base arch.
 
-Current version: **v1.15.2**
+Current version: see `UPSTREAM_TAG`.
 
 ## How builds work
 
@@ -37,13 +41,28 @@ Current version: **v1.15.2**
 ### Build process
 
 - `build-push.yml` checks out the Chainguard fork at the specified tag
+- **Builds the patched nginx base image** from `images/nginx` (`make -C images/nginx push`),
+  tagged from `images/nginx/TAG`. Skipped if that tag already exists in GHCR (the compile
+  is expensive); `force_base_rebuild` input overrides. See "Why we build the nginx base".
 - Syncs `TAG` file with git tag version to ensure consistency (e.g., `controller-v1.15.2` -> `v1.15.2`)
-- Runs `make release` with `REGISTRY=ghcr.io/ethershieldhq/ingress-nginx`
-- This is the **exact same build process** as upstream - no custom Dockerfile or build args
-- `make release` reads `NGINX_BASE` file for base image, `TAG` file for version
-- Builds multi-arch and pushes `controller` + `controller-chroot` images to GHCR
+- Runs `make release` with `REGISTRY=ghcr.io/ethershieldhq/ingress-nginx` and
+  `BASE_IMAGE=ghcr.io/ethershieldhq/ingress-nginx/nginx:<base-tag>` so the controller is
+  built FROM the patched base instead of the frozen upstream base pinned in `NGINX_BASE`
+- Builds `controller` + `controller-chroot` (amd64) and pushes to GHCR
 - Updates `UPSTREAM_TAG` file in this repo
-- Adds OCI annotations (description, source, vendor)
+- Adds OCI annotations (description, source, vendor, base image ref)
+
+### Why we build the nginx base
+
+The fork's `NGINX_BASE` file pins the controller to the upstream base image
+`registry.k8s.io/ingress-nginx/nginx`, which is frozen (the project reached EOL 2026-04-03)
+and does **not** contain the fork's own nginx CVE backports (e.g. CVE-2026-9256 rewrite heap
+overflow). Those patches live in `images/nginx/rootfs/patches/` and are only compiled in when
+the nginx base image is built from source. A plain `make release` links the controller against
+the unpatched upstream base, so the controller image ships vulnerable nginx despite tracking
+the security fork. To actually get the patches we build the base ourselves, publish it, and
+point the controller build at it via `BASE_IMAGE`. The base only rebuilds when the fork bumps
+`images/nginx/TAG`.
 
 ### Tag format
 
@@ -96,7 +115,8 @@ gh run watch --repo EtherShieldHQ/ingress-nginx-build
 ## Key decisions
 
 - **GHCR over Docker Hub:** Docker Hub doesn't support nested repo paths (`org/repo/image`). GHCR does, allowing `ethershieldhq/ingress-nginx/controller`.
-- **`make release` over custom build:** We use the exact upstream build process to guarantee identical output. Only `REGISTRY` env var is changed.
+- **Build the nginx base ourselves:** the only way to actually ship the fork's nginx CVE patches (see "Why we build the nginx base"). `BASE_IMAGE` override repoints the controller build off the frozen upstream base. Otherwise the build follows the exact upstream process.
+- **amd64-only:** multi-arch would compile the nginx base under QEMU for hours; the controller arch must match the base arch.
 - **Public images:** Org-level GitHub setting changed to allow public packages. No imagePullSecret needed on clusters.
 - **No helm chart fork:** We use the official `kubernetes.github.io/ingress-nginx` helm chart as-is, only overriding the image.
 
@@ -106,7 +126,7 @@ gh run watch --repo EtherShieldHQ/ingress-nginx-build
 |---|---|
 | `UPSTREAM_TAG` | Tracks current upstream tag, updated by CI |
 | `.github/workflows/check-upstream.yml` | Daily cron, detects new releases |
-| `.github/workflows/build-push.yml` | Builds and pushes multi-arch images |
+| `.github/workflows/build-push.yml` | Builds the patched nginx base + controller (amd64) and pushes to GHCR |
 
 ## CI authentication
 
