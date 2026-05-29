@@ -44,7 +44,7 @@ Current version: see `UPSTREAM_TAG`.
 - **Builds the patched nginx base image** from `images/nginx` (`make -C images/nginx push`),
   tagged from `images/nginx/TAG`. Skipped if that tag already exists in GHCR (the compile
   is expensive); `force_base_rebuild` input overrides. See "Why we build the nginx base".
-- Syncs `TAG` file with git tag version to ensure consistency (e.g., `controller-v1.15.2` -> `v1.15.2`)
+- Syncs `TAG` file with git tag version to ensure consistency (e.g., `controller-v1.15.6` -> `v1.15.6`)
 - Runs `make release` with `REGISTRY=ghcr.io/ethershieldhq/ingress-nginx` and
   `BASE_IMAGE=ghcr.io/ethershieldhq/ingress-nginx/nginx:<base-tag>` so the controller is
   built FROM the patched base instead of the frozen upstream base pinned in `NGINX_BASE`
@@ -66,23 +66,24 @@ point the controller build at it via `BASE_IMAGE`. The base only rebuilds when t
 
 ### Tag format
 
-- Upstream git tags: `controller-v1.15.2`
-- Image tags: version extracted from git tag (`:v1.15.2`)
+- Upstream git tags: `controller-v1.15.6`
+- Image tags: version extracted from git tag (`:v1.15.6`)
 - Check [Chainguard fork tags](https://github.com/chainguard-forks/ingress-nginx/tags) for available `controller-*` releases
 
 ## Deploy with helm
 
-The official [ingress-nginx helm chart](https://kubernetes.github.io/ingress-nginx) is used as-is. Only the image is overridden.
+No chart fork: the official [ingress-nginx helm chart](https://kubernetes.github.io/ingress-nginx) is used as-is, only the image is overridden. Controller `v1.15.6` pairs with the chart's `4.15.x` line (chart `4.15.6` ships appVersion `1.15.6`) - pin a `4.15.x` chart and override the image to this build.
 
 ### Fresh install
 
 ```bash
 helm upgrade --install ingress-nginx ingress-nginx \
   --repo https://kubernetes.github.io/ingress-nginx \
+  --version 4.15.6 \
   --namespace ingress-nginx --create-namespace \
   --set controller.image.registry=ghcr.io \
   --set controller.image.image=ethershieldhq/ingress-nginx/controller \
-  --set controller.image.tag=v1.15.2 \
+  --set controller.image.tag=v1.15.6 \
   --set controller.image.digest=""
 ```
 
@@ -91,22 +92,24 @@ helm upgrade --install ingress-nginx ingress-nginx \
 ```bash
 helm upgrade ingress-nginx ingress-nginx \
   --repo https://kubernetes.github.io/ingress-nginx \
+  --version 4.15.6 \
   --namespace ingress-nginx \
   --reuse-values \
   --set controller.image.registry=ghcr.io \
   --set controller.image.image=ethershieldhq/ingress-nginx/controller \
-  --set controller.image.tag=v1.15.2 \
+  --set controller.image.tag=v1.15.6 \
   --set controller.image.digest=""
 ```
 
 - `--reuse-values` preserves all existing config (nodeport, replicas, etc.)
 - `--set controller.image.digest=""` is required to override the hardcoded digest in the chart
+- amd64-only image (see Images above) - schedule the controller on x86_64 nodes
 
 ## Manual build
 
 ```bash
 # Trigger a build for a specific tag
-gh workflow run build-push.yml -f tag=controller-v1.15.2 --repo EtherShieldHQ/ingress-nginx-build
+gh workflow run build-push.yml -f tag=controller-v1.15.6 --repo EtherShieldHQ/ingress-nginx-build
 
 # Monitor the build
 gh run watch --repo EtherShieldHQ/ingress-nginx-build
